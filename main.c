@@ -18,20 +18,18 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include "nvs.h"
 
 char WIFI_SSID[100] = "";
 char WIFI_PASS[100] = "";
 static lv_obj_t *active_field = NULL;
 LV_FONT_DECLARE(lv_font_unscii_8);
-
-#define SERVER_IP   "192.168.178.91"
+char SERVER_IP[16] = "192.168.178.91";
 #define SERVER_PORT 8765
-
 #define CONNECTED BIT0
 #define FAILED    BIT1
 static int label_y[100];
 char ip[32];
-
 static void create_keyboard(int check);
 
 const char *buchstaben[] = {
@@ -57,27 +55,25 @@ const char *zahlen[] = {
     "7", "8", "9", "0", "<-", "+",
     "-", "*", "/", "=", "(", ")",
     "{", "}", "[", "]", "ABC", "$",
-    "!", "?", "@", "!_", "_!", "<",
+    "!", "?", "@", "!_!", ".", "<",
     ">", "#", "->", "^^"
 };
 lv_obj_t *label_button[100];
 static char text[100] = "";
 static lv_obj_t *label;
 static lv_obj_t *keyboard_container;
-
+static int sock = -1;
 int raw = 0;
 int selectes = 0;
 int wselect = 0;
 int line = 0;
 static char callback[20] = "";
-
-
 int worky = 0;
 int wline = 0;
 static const char *TAG = "ESP32";
 static EventGroupHandle_t wifi_events;
 static int retries = 0;
-
+char nachricht23[256];
 /* Verhindert mehrfachen Start der WLAN-Task */
 static bool wifi_task_started = false;
 
@@ -100,17 +96,12 @@ static void inputfields(int x, int y,int xs, int ys,  const char *name){
     lv_obj_add_event_cb(button, activ_text, LV_EVENT_CLICKED, label_button);
 }
 
-static void logkonsole(const char *name)
-{
+static void logkonsole(const char *name){
     if (line >= 100) return;
-
     printf("lines:%d\n", line);
-
     for (int i = 0; i < line; i++) {
         label_y[i] -= 20;
-        lv_obj_set_pos(label_button[i], 30, label_y[i]);
-    }
-
+        lv_obj_set_pos(label_button[i], 30, label_y[i]);}
     label_button[line] = lv_label_create(label);
     lv_obj_set_layout(label, LV_LAYOUT_NONE);
     lv_label_set_text(label_button[line], name);
@@ -118,56 +109,47 @@ static void logkonsole(const char *name)
     lv_obj_set_style_text_color(label_button[line], lv_color_black(), 0);
     lv_obj_set_size(label_button[line], 900, 20);
     lv_label_set_long_mode(label_button[line], LV_LABEL_LONG_CLIP);
-
     label_y[line] = 300;
     lv_obj_set_pos(label_button[line], 30, label_y[line]);
-
-    line++;
-}
+    line++;}
 /* Nachricht senden */
-static void send_message(const char *msg)
-{
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-    if (sock < 0) return;
 
-    struct sockaddr_in server = {
-        .sin_family = AF_INET,
-        .sin_port = htons(SERVER_PORT)
-    };
-
-    inet_pton(AF_INET, SERVER_IP, &server.sin_addr);
-
-    if (connect(sock, (struct sockaddr *)&server, sizeof(server)) == 0) {
-        send(sock, msg, strlen(msg), 0);
-    }
-
-    close(sock);
+/* WLAN-Daten speichern */
+static void save_wifi(void){
+    nvs_handle_t nvs;
+    if (nvs_open("wifi", NVS_READWRITE, &nvs) != ESP_OK)
+        return;
+    nvs_set_str(nvs, "ssid", WIFI_SSID);
+    nvs_set_str(nvs, "pass", WIFI_PASS);
+    nvs_commit(nvs);
+    nvs_close(nvs);
 }
 
+
+/* WLAN-Daten laden */
+static bool load_wifi(void){
+    nvs_handle_t nvs;
+    if (nvs_open("wifi", NVS_READONLY, &nvs) != ESP_OK)
+        return false;
+    size_t ssid_len = sizeof(WIFI_SSID);
+    size_t pass_len = sizeof(WIFI_PASS);
+    esp_err_t err1 = nvs_get_str(nvs, "ssid", WIFI_SSID, &ssid_len);
+    esp_err_t err2 = nvs_get_str(nvs, "pass", WIFI_PASS, &pass_len);
+    nvs_close(nvs);
+    return err1 == ESP_OK && err2 == ESP_OK;
+}
+
+/* Nachricht senden */
+static int send_message(const char *msg){
+    if (sock < 0){return -1;}
+    return send(sock, msg, strlen(msg), 0);}
 
 /* Nachricht empfangen */
 static int receive_message(char *buffer, size_t size){
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
     if (sock < 0) return -1;
-    struct sockaddr_in server = {
-        .sin_family = AF_INET,
-        .sin_port = htons(SERVER_PORT)
-    };
-    inet_pton(AF_INET, SERVER_IP, &server.sin_addr);
-
-    if (connect(sock, (struct sockaddr *)&server, sizeof(server)) != 0) {
-        close(sock);
-        return -1;
-    }
-
     int len = recv(sock, buffer, size - 1, 0);
-
-    if (len > 0) {
-        buffer[len] = '\0';
-    }
-    close(sock);
-    return len;
-}
+    if (len > 0) {buffer[len] = '\0';}
+    return len;}
 
 
 /* WLAN-Ereignisse */
@@ -188,6 +170,18 @@ static void wifi_event(void *arg, esp_event_base_t base,int32_t id, void *data){
     }
 }
 
+static int connect_server(void){
+    sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (sock < 0) {return -1;}
+    struct sockaddr_in server = {.sin_family = AF_INET,.sin_port = htons(SERVER_PORT)};
+    inet_pton(AF_INET, SERVER_IP, &server.sin_addr);
+    if (connect(sock, (struct sockaddr *)&server,sizeof(server)) != 0) {
+        close(sock);
+        sock = -1;
+        return -1;
+    }
+    return 0;
+}
 /* WLAN starten */
 static bool wifi_start(void){
     wifi_events = xEventGroupCreate();
@@ -210,24 +204,27 @@ static bool wifi_start(void){
     return (bits & CONNECTED) != 0;
 }
 
-
 /* WLAN und Nachrichten in eigener Task */
 static void wifi_task(void *arg){
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
-        err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
-    if (wifi_start()) {
-        while (true) {
+    while (true) {
             send_message("1");
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
-    }
     wifi_task_started = false;
     vTaskDelete(NULL);
+}
+
+static void connect23(){
+    send_message("?");
+    int len = receive_message(nachricht23, sizeof(nachricht23));
+    if (len > 0) {
+    logkonsole(nachricht23);
+    } else {
+    logkonsole("Fehler beim Empfangen");
+    }
+    send_message("Test+1234");
+
+
 }
 
 /* Touch für LVGL */
@@ -259,17 +256,25 @@ static void wificonnection(){
             logkonsole(inhalt2);
             logkonsole("Verbinde mit WLAN...");
             strncat(WIFI_PASS, inhalt2,sizeof(WIFI_PASS) - strlen(WIFI_PASS) - 1);
+            save_wifi();
+            wifi_start();
+            logkonsole("IP des zu verbindenen Gerätes:");
+        } else if (wselect == 4){
+            const char *inhalt = lv_label_get_text(active_field);
+            callback[0] = '\0';
+            strcpy(SERVER_IP, inhalt);
             if (!wifi_task_started) {
                 wifi_task_started = true;
                 BaseType_t result = xTaskCreate(wifi_task,"wifi_task",8192,NULL,5,NULL);
                 if (result != pdPASS) {wifi_task_started = false;}
             }
+            connect_server();
+            connect23();
+        } else if (wselect == 30){
+            logkonsole("Verbinde mit WLAN...");
+            wifi_start();
             logkonsole("IP des zu verbindenen Gerätes:");
-        } else if (wselect == 4){
-            const char *inhalt = lv_label_get_text(active_field);
-            callback[0] = '\0';
-
-
+            wselect = 3;
         }
 }
 
@@ -302,7 +307,17 @@ static void button_event(lv_event_t *e)
         }else if (strcmp(buchstabe, "->") == 0) {
     if (strcmp(callback, "") != 0) {
         if (strcmp(callback, "wificonnection") == 0) {
+            if (strcmp(lv_label_get_text(active_field), "LOAD") == 0){
+                if (load_wifi()) {
+                logkonsole("Gespeicherte WLAN-Daten geladen");
+                wselect = 29;
+                wificonnection();
+
+            } else {
             wificonnection();
+            }
+
+            } else{wificonnection();}
         }
     }
 }
@@ -368,63 +383,39 @@ static lv_obj_t *keyboard(const char *button_text,int x, int y, int sx, int sy, 
     return button;
 }
 
-
-static void create_keyboard(int check)
-{
+static void create_keyboard(int check){
     if (keyboard_container != NULL) {
         lv_obj_delete(keyboard_container);
-        keyboard_container = NULL;
-    }
+        keyboard_container = NULL;}
     if (check == 1) {
         keyboard_container = lv_obj_create(lv_screen_active());
         lv_obj_set_size(keyboard_container, 1024, 280);
         lv_obj_set_pos(keyboard_container, 0, 320);
-
-        lv_obj_set_style_bg_opa(
-            keyboard_container, LV_OPA_TRANSP, 0);
-
-        lv_obj_set_style_border_width(
-            keyboard_container, 0, 0);
-
-        lv_obj_set_style_pad_all(
-            keyboard_container, 0, 0);
-
+        lv_obj_set_style_bg_opa(keyboard_container, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(keyboard_container, 0, 0);
+        lv_obj_set_style_pad_all(keyboard_container, 0, 0);
         int xh = 0;
         int yh = 0;
-
         for (int i = 0; i < 34; i++) {
-
             if (i == 33) {
                 xh = 0;
-                yh = 0;
-            }
-            else if (i < 11) {
+                yh = 0;}else if (i < 11) {
                 xh = i * 93;
-                yh = 70;
-            }
-            else if (i < 22) {
+                yh = 70;}else if (i < 22) {
                 xh = (i - 11) * 93;
-                yh = 140;
-            }
-            else {
+                yh = 140;}else {
                 xh = (i - 22) * 93;
-                yh = 210;
-            }
-
-            keyboard(
-                selectes == 2 ? zahlen[i] :
-                selectes == 1 ? buchstaben1[i] :
-                                buchstaben[i],
-                xh, yh, 93,70, check, button_event);
-        }
-    }
-    else {
-        keyboard(buchstaben[34], 0, 550, 50 , 50, check,
-                 button_event);
-    }
-}
+                yh = 210;}
+            keyboard(selectes == 2 ? zahlen[i] :selectes == 1 ? buchstaben1[i] :buchstaben[i],xh, yh, 93,70, check, button_event);}
+    }else {keyboard(buchstaben[34], 0, 550, 50 , 50, check,button_event);}}
 
 void app_main(void){
+    esp_err_t err2 = nvs_flash_init();
+    if (err2 == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err2 == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err2 = nvs_flash_init();}
+    ESP_ERROR_CHECK(err2);
     if (i2c_init() != ESP_OK) {
         ESP_LOGE(TAG, "I2C initialization failed");
         return;}
